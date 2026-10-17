@@ -60,7 +60,7 @@ def _gaia_astrometry():
     """Create a GaiaAstrometry object for asteroids 673 and 779 from the local test archive.
     Runs once per module"""
     gaia_astrometry = GaiaAstrometry.load_from_local_archive(
-        ASTROMETRY_ARCHIVE_PATH, TEST_ASTEROID_MPC
+        TEST_ASTEROID_MPC, ASTROMETRY_ARCHIVE_PATH
     )
     gaia_astrometry.apply_filters()
     return gaia_astrometry
@@ -116,7 +116,7 @@ def test_astrometry_retrieval_no_data():
         GaiaAstrometry.load_from_astroquery([asteroid_no_data])
     # Local variant
     with pytest.raises(RuntimeError):
-        GaiaAstrometry.load_from_local_archive(ASTROMETRY_ARCHIVE_PATH, [asteroid_no_data])
+        GaiaAstrometry.load_from_local_archive([asteroid_no_data], ASTROMETRY_ARCHIVE_PATH)
 
 
 def test_mpc_number_zero_is_rejected():

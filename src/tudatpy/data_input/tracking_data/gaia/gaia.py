@@ -2,6 +2,7 @@
 Retrieve Gaia FPR astrometry from the archives
 """
 
+import sys
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -21,6 +22,7 @@ from tudatpy.data_input.tracking_data import (
     TranslationalStateSupplementaryData,
 )
 from tudatpy.constants import ASTRONOMICAL_UNIT, JULIAN_DAY
+from tudatpy.resource_installer import download_extra_file, DEFAULT_DEST, DEFAULT_CACHE, _verify_md5
 from scipy.linalg import block_diag
 from scipy.constants import arcsec
 from warnings import warn
@@ -38,6 +40,7 @@ _STATE_SCALING_FACTOR = 1.0000000051686297  # account for Gaia FPR state vector 
 _ASTROMETRY_CATALOG = "gaiafpr.sso_observation"  # Latest Gaia data release as of sep. 2026
 _ASTEROID_CATALOG = "gaiafpr.sso_source"
 _TIME_SCALE_CONVERTER = default_time_scale_converter()
+_GAIA_RESOURCES = DEFAULT_DEST / "gaia"
 
 
 def _check_for_missing_entries(
@@ -58,31 +61,146 @@ def _as_iterable(data) -> Iterable:
     return [data] if np.isscalar(data) else data
 
 
+def download_gaia_archive(force: bool = False) -> None:
+    """
+    This function downloads and stores a local copy of the Gaia archives ( https://gea.esac.esa.int/archive/)
+
+    This function downloads and stores a local copy of the latest Gaia data release, containing the observations,
+    observation metadata and orbit data for all asteroids. This allows for offline and very fast
+    retrieval of the Gaia observations. The data is stored as Apache Parquet files, taking up roughly 10GB in total.
+
+    Parameters
+    ----------
+    force : bool, optional
+        If true, overwrites existing gaia files
+    """
+    while True:
+        user_query = input(
+            "The Gaia observations and metadata will be downloaded and stored on your computer (±10 GB)."
+            "Proceed? (y/n)"
+        )
+        if user_query.lower() == "y":
+            break
+        if user_query.lower() == "n":
+            sys.exit()
+
+    _GAIA_RESOURCES.mkdir(parents=True, exist_ok=True)
+
+    # Observation and metadata
+    print("Downloading observations...")
+    _download_gaia_data(
+        file_name_prefix="SsoObservation",
+        catalog_name="sso_observation",
+        destination_dir=_GAIA_RESOURCES,
+        force=force,
+    )
+    _generate_parquet(
+        destination_dir=_GAIA_RESOURCES,
+        csv_prefix="SsoObservation",
+        parquet_name="sso_observation",
+    )
+
+    # Source archive
+    print("Downloading orbit data...")
+    _download_gaia_data(
+        file_name_prefix="SsoSource",
+        catalog_name="sso_source",
+        destination_dir=_GAIA_RESOURCES,
+        force=force,
+    )
+    _generate_parquet(
+        destination_dir=_GAIA_RESOURCES,
+        csv_prefix="SsoSource",
+        parquet_name="sso_source",
+        literal_array_columns=[
+            "orbital_elements_var_covar_matrix",
+            "h_state_vector",
+            "h_state_vector_var_covar_matrix",
+        ],
+    )
+
+    print("Gaia data download complete.")
+
+
+def _download_gaia_data(
+    file_name_prefix: str,
+    catalog_name: str,
+    destination_dir: Path,
+    max_tries: int = 3,
+    force: bool = False,
+) -> None:
+    """Download Gaia data"""
+    base_url = f"https://cdn.gea.esac.esa.int/Gaia/gfpr/Solar_system/{catalog_name}/"
+    # ^^^ Base URL must be changed for future data releases!
+
+    file_names = [f"{file_name_prefix}_{i:02d}.csv.gz" for i in range(20)]
+    md5_file = "_MD5SUM.txt"
+    download_extra_file(
+        url=base_url + md5_file,
+        dest_path=destination_dir / md5_file,
+        cache_dir=DEFAULT_CACHE,
+        force=force,
+    )
+    md5sums = {}
+    with open(destination_dir / md5_file) as f:
+        for line in f:
+            md5, md5_file_name = line.strip().split()
+            md5sums[md5_file_name] = md5
+    (destination_dir / md5_file).unlink()
+
+    for file_name in file_names:
+        url = base_url + file_name
+        path_to_file = destination_dir / file_name
+
+        if path_to_file.exists() and not force:
+            continue
+
+        for i in range(max_tries):
+
+            download_extra_file(
+                url=url, dest_path=path_to_file, cache_dir=DEFAULT_CACHE, force=force
+            )
+
+            if _verify_md5(path_to_file, md5sums[file_name]):
+                break
+
+            if i < max_tries - 1:
+                print(f"Download corrupted, retrying... {i+2}/{max_tries}")
+            else:
+                raise RuntimeError("Error while downloading Gaia files. Aborting installation")
+
+
 def _generate_parquet(
-    archive_dir: Path | str,
-    dir_to_save: Path | str,
+    destination_dir: Path | str,
     csv_prefix: str,
     parquet_name: str,
     literal_array_columns: list | None = None,
 ) -> None:
-    """Concatenate the 20 numbered Gaia archive CSV files into a single .parquet file."""
-    print("Loading archive from CSV files\n")
+    """
+    Convert CSV files into Apache Parquet for faster loading times
 
-    chunks = []
+    Parameters
+    ----------
+    destination_dir : Path | str
+        Path where CSV files are saved, and where parquet file will be saved
+    csv_prefix : str
+        Prefix in CSV file name
+    parquet_name : str
+        Name of the generated parquet file
+    literal_array_columns : list
+        Column names of literal arrays stored as str
+    """
+    data_chunks = []
+    get_file_name = lambda num: f"{csv_prefix}_{num:02d}.csv.gz"
 
     for i in range(20):
-        print(f"Loading file number {i}/19...")
-        csv_file_base = Path(archive_dir) / f"{csv_prefix}_{i:02d}"
-        compressed_csv_file = csv_file_base.with_suffix(".csv.gz")
-        csv_file = (
-            compressed_csv_file
-            if compressed_csv_file.exists()
-            else csv_file_base.with_suffix(".csv")
-        )
-        chunks.append(pd.read_csv(csv_file, comment="#"))
+        # Load data into a dataframe
+        file_name = get_file_name(i)
+        path_to_file = destination_dir / file_name
+        data_chunks.append(pd.read_csv(path_to_file, comment="#", compression="gzip"))
 
-    table = pd.concat(chunks, ignore_index=True)
-    del chunks
+    table = pd.concat(data_chunks, ignore_index=True)
+    del data_chunks
 
     # Literal lists need to be converted to Python lists
     str_to_list = lambda entry: ast.literal_eval(entry) if isinstance(entry, str) else None
@@ -93,64 +211,13 @@ def _generate_parquet(
     table = table.sort_values("number_mp", ignore_index=True)
 
     # Save to .parquet
-    table.to_parquet(Path(dir_to_save) / parquet_name, row_group_size=250000)
+    table.to_parquet(destination_dir / f"{parquet_name}.parquet", row_group_size=250000)
 
+    # Clean up gz files
+    for i in range(20):
+        (destination_dir / get_file_name(i)).unlink()
 
-def generate_astrometry_parquet(archive_dir: Path | str, dir_to_save: Path | str) -> None:
-    """
-    Generate a .parquet file of the Gaia astrometry archive, to be used to retrieve data locally.
-
-    The resulting file is saved as ``gaia_astrometry_archive.parquet`` and can be passed to
-    :meth:`~tudatpy.data_input.tracking_data.gaia.GaiaAstrometry.load_from_local_archive`.
-
-    Requires all ``SsoObservation_*.csv.gz`` files to be stored in the same directory. Uncompressed
-    ``.csv`` files are also supported. Files can be downloaded from:
-    https://cdn.gea.esac.esa.int/?prefix=Gaia/gfpr/Solar_system/sso_observation/
-
-    Parameters
-    ----------
-    archive_dir : Path | str
-        Path to the archive directory where the CSV files are stored.
-    dir_to_save : Path | str
-        Directory where the .parquet file should be saved.
-    """
-    _generate_parquet(
-        archive_dir,
-        dir_to_save,
-        csv_prefix="SsoObservation",
-        parquet_name="gaia_astrometry_archive.parquet",
-    )
-
-
-def generate_asteroid_parquet(archive_dir: Path | str, dir_to_save: Path | str) -> None:
-    """
-    Generate a .parquet file of the Gaia asteroid archive, to be used to retrieve data locally.
-
-    The resulting file is saved as ``gaia_source_archive.parquet`` and can be passed to
-    :func:`~tudatpy.data_input.tracking_data.gaia.gaia_object_catalog`.
-
-    Requires all ``SsoSource_*.csv.gz`` files to be stored in the same directory. Uncompressed
-    ``.csv`` files are also supported. Files can be downloaded from:
-    https://cdn.gea.esac.esa.int/?prefix=Gaia/gfpr/Solar_system/sso_source/
-
-    Parameters
-    ----------
-    archive_dir : Path | str
-        Path to the archive directory where the CSV files are stored.
-    dir_to_save : Path | str
-        Directory where the .parquet file should be saved.
-    """
-    _generate_parquet(
-        archive_dir,
-        dir_to_save,
-        csv_prefix="SsoSource",
-        parquet_name="gaia_source_archive.parquet",
-        literal_array_columns=[
-            "orbital_elements_var_covar_matrix",
-            "h_state_vector",
-            "h_state_vector_var_covar_matrix",
-        ],
-    )
+    print(f"{parquet_name}.parquet saved at {destination_dir}")
 
 
 class GaiaAstrometry:
@@ -172,7 +239,7 @@ class GaiaAstrometry:
         # Load from the online database...
         ga = GaiaAstrometry.load_from_astroquery(asteroid_mpc_number)
         # or from a locally saved .parquet of the observations
-        # ga = GaiaAstrometry.load_from_local_archive(_path_to_parquet_, asteroid_mpc_number)
+        # ga = GaiaAstrometry.load_from_local_archive(asteroid_mpc_number)
 
         # Show a summary of observation...
         ga.print_summary()
@@ -507,22 +574,23 @@ class GaiaAstrometry:
     @classmethod
     def load_from_local_archive(
         cls,
-        archive_file_path: str | Path,
         mpc_numbers: int | Iterable[int],
+        path_to_archive: str | Path | None = None,
     ) -> "GaiaAstrometry":
         """
-        Retrieve astrometry locally from a .parquet file (generated by :func:`~tudatpy.data_input.tracking_data.gaia.generate_astrometry_parquet`).
+        Retrieve astrometry from locally saved archive.
 
         Mirrors :meth:`~tudatpy.data_input.tracking_data.gaia.GaiaAstrometry.load_from_astroquery`. This method of loading data is typically
         much faster, at a small one-time cost of generating parquet files.
 
         Parameters
         ----------
-        archive_file_path : str | Path
-            Path to the .parquet file.
         mpc_numbers : int | list[int]
             Positive asteroid MPC number or list of positive asteroid MPC numbers to retrieve data for. Gaia's shared
             MPC number 0 for natural planetary satellites is not supported.
+        path_to_archive : str | Path | None
+            Points to the path that contains observations. If None, it will look for the downloaded archive in the
+            tudat resource directory (downloaded using download_gaia_archive).
 
         Returns
         -------
@@ -531,8 +599,19 @@ class GaiaAstrometry:
         """
         mpc_numbers = _as_iterable(mpc_numbers)
 
+        # Locate file
+        if path_to_archive is None:
+            path_to_parquet = _GAIA_RESOURCES / "sso_observation.parquet"
+            if not path_to_parquet.exists():
+                raise FileNotFoundError(
+                    f"No locally saved observations found in {_GAIA_RESOURCES}"
+                    "Use download_gaia_archive() to download all available Gaia data."
+                )
+        else:
+            path_to_parquet = path_to_archive
+
         # Read from parquet
-        table = pd.read_parquet(archive_file_path, filters=[("number_mp", "in", mpc_numbers)])
+        table = pd.read_parquet(path_to_parquet, filters=[("number_mp", "in", mpc_numbers)])
         _check_for_missing_entries(table, mpc_numbers)
 
         # convert to tudat-format
@@ -721,7 +800,7 @@ def load_gaia_astrometry(
             gaia = GaiaAstrometry.load_from_aip(target, save_to_archive=archive_path)
         else:
             print(f"Loading Gaia astrometry from {archive_path}", flush=True)
-            gaia = GaiaAstrometry.load_from_local_archive(archive_path, target)
+            gaia = GaiaAstrometry.load_from_local_archive(target, archive_path)
     except RuntimeError as error:
         if str(error).startswith("No observations found"):
             print(f"No Gaia observations for {target}.", flush=True)
@@ -821,9 +900,7 @@ def _prepare_gaia_asteroid_table(table: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def _get_asteroid_table_row(
-    mpc_number: int, archive_file_path: Path | str | None = None
-) -> pd.DataFrame:
+def _get_asteroid_table_row(mpc_number: int, local: bool) -> pd.DataFrame:
     """Retrieve and prepare Gaia-derived data for one asteroid (one row in the full table)"""
     if mpc_number == 0:
         raise ValueError(
@@ -832,8 +909,15 @@ def _get_asteroid_table_row(
         )
 
     # Load from the .parquet
-    if archive_file_path is not None:
-        table = pd.read_parquet(archive_file_path, filters=[("number_mp", "in", [mpc_number])])
+    if local:
+        path_to_parquet = _GAIA_RESOURCES / "sso_source.parquet"
+        if not path_to_parquet.exists():
+            raise FileNotFoundError(
+                f"No Gaia data files found in {_GAIA_RESOURCES}"
+                "Run download_gaia_archive() to download all available Gaia data"
+            )
+
+        table = pd.read_parquet(path_to_parquet, filters=[("number_mp", "in", [mpc_number])])
 
     # Load from astroquery
     else:
@@ -857,7 +941,7 @@ def _get_asteroid_table_row(
 
 def get_state_from_gaia_archive(
     mpc_number: int,
-    archive_file_path: Path | str | None = None,
+    query_online_database: bool = True,
     frame_origin: str = "Sun",
     frame_orientation: str = "J2000",
 ) -> tuple[float, np.ndarray]:
@@ -872,8 +956,9 @@ def get_state_from_gaia_archive(
     mpc_number : int
         Positive MPC number of asteroid to retrieve state for. Gaia's shared MPC number 0 for natural planetary
         satellites is not supported.
-    archive_file_path : Path | str, optional
-        Path to the archive .parquet file. If None, retrieve state with astroquery. By default None
+    query_online_database : bool, optional
+        If true, queries the online database through astroquery. If false, tries to load from locally stored data
+        (downloaded using download_gaia_archive())
     frame_origin : str
         Origin of the state vector, by default 'Sun'
     frame_orientation : str
@@ -886,11 +971,14 @@ def get_state_from_gaia_archive(
     np.ndarray
         State vector in SI units.
     """
-    object_row = _get_asteroid_table_row(mpc_number, archive_file_path).loc[mpc_number]
-    epoch, state = (
+    object_row = _get_asteroid_table_row(mpc_number, local=not query_online_database).loc[
+        mpc_number
+    ]
+
+    epoch, state = (  # Heliocentric J2000
         object_row["epoch_state_vector"],
         object_row["h_state_vector"],
-    )  # Heliocentric J2000
+    )
 
     # Translate origin
     if frame_origin != "Sun":
@@ -918,7 +1006,8 @@ def get_state_from_gaia_archive(
 
 
 def get_state_covariance_from_gaia_archive(
-    mpc_number: int, archive_file_path: Path | str | None = None
+    mpc_number: int,
+    query_online_database: bool = True,
 ) -> tuple[float, np.ndarray]:
     """
     Retrieve a Cartesian state covariance matrix for an object queried by MPC number.
@@ -931,8 +1020,9 @@ def get_state_covariance_from_gaia_archive(
     mpc_number : int
         Positive MPC number of asteroid to retrieve covariance for. Gaia's shared MPC number 0 for natural planetary
         satellites is not supported.
-    archive_file_path : Path | str, optional
-        Path to the archive .parquet file. If None, covariance is retrieved through astroquery, by default None
+    query_online_database : bool, optional
+        If true, queries the online database through astroquery. If false, tries to load from locally stored data
+        (downloaded using download_gaia_archive())
 
     Returns
     -------
@@ -941,12 +1031,15 @@ def get_state_covariance_from_gaia_archive(
     np.ndarray
         Cartesian state covariance matrix in SI units.
     """
-    object_row = _get_asteroid_table_row(mpc_number, archive_file_path).loc[mpc_number]
+    object_row = _get_asteroid_table_row(mpc_number, local=not query_online_database).loc[
+        mpc_number
+    ]
     return object_row["epoch_state_vector"], object_row["h_state_vector_var_covar_matrix"]
 
 
 def get_kepler_covariance_from_gaia_archive(
-    mpc_number: int, archive_file_path: Path | str | None = None
+    mpc_number: int,
+    query_online_database: bool = True,
 ) -> tuple[float, np.ndarray]:
     """
     Retrieve a Keplerian covariance matrix for an object queried by MPC number.
@@ -958,8 +1051,9 @@ def get_kepler_covariance_from_gaia_archive(
     mpc_number : int
         Positive MPC number of asteroid to retrieve covariance for. Gaia's shared MPC number 0 for natural planetary
         satellites is not supported.
-    archive_file_path : Path | str, optional
-        Path to the archive .parquet file, by default None
+    query_online_database : bool, optional
+        If true, queries the online database through astroquery. If false, tries to load from locally stored data
+        (downloaded using download_gaia_archive())
 
     Returns
     -------
@@ -969,11 +1063,13 @@ def get_kepler_covariance_from_gaia_archive(
         Keplerian covariance matrix in SI and radians, ordered as
         ``[semi-major axis, eccentricity, inclination, RAAN, arg. of periapsis, mean anomaly]``
     """
-    object_row = _get_asteroid_table_row(mpc_number, archive_file_path).loc[mpc_number]
+    object_row = _get_asteroid_table_row(mpc_number, local=not query_online_database).loc[
+        mpc_number
+    ]
     return object_row["epoch_state_vector"], object_row["orbital_elements_var_covar_matrix"]
 
 
-def gaia_object_catalog(archive_file_path: Path | str) -> pd.DataFrame:
+def gaia_object_catalog() -> pd.DataFrame:
     """
     Retrieve the Gaia object catalog (sso_source in Gaia documentation). This table contains primarily the state
     and covariance of asteroids that were derived using the latest Gaia dataset (see Gaia Collaboration (2023)). The functions
@@ -981,10 +1077,7 @@ def gaia_object_catalog(archive_file_path: Path | str) -> pd.DataFrame:
     and :func:`~tudatpy.data_input.tracking_data.gaia.get_kepler_covariance_from_gaia_archive` can be used to obtain this information for a
     single object queried by MPC number.
 
-    Parameters
-    ----------
-    archive_file_path : Path | str
-        Path to the archive .parquet file.
+    This function requires that the Gaia data is downloaded and stored on disk (see ``download_gaia_archive()``).``
 
     Returns
     -------
@@ -992,4 +1085,10 @@ def gaia_object_catalog(archive_file_path: Path | str) -> pd.DataFrame:
         Complete asteroid catalog in tudat-compatible units, indexed by MPC number. Natural planetary satellites are
         excluded because Gaia assigns MPC number 0 to all of them.
     """
-    return _prepare_gaia_asteroid_table(pd.read_parquet(archive_file_path))
+    path_to_parquet = _GAIA_RESOURCES / "sso_source.parquet"
+    if not path_to_parquet.exists():
+        raise FileNotFoundError(
+            f"No Gaia data files found in {_GAIA_RESOURCES}"
+            "Run download_gaia_archive() to download all available Gaia data"
+        )
+    return _prepare_gaia_asteroid_table(pd.read_parquet(path_to_parquet))

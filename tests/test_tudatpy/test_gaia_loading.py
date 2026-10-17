@@ -31,7 +31,7 @@ def aip_response(table, status="OK"):
 
 
 def test_local_loading_utc_dates_matches_existing_filters():
-    raw = GaiaAstrometry.load_from_local_archive(ARCHIVE, 673)
+    raw = GaiaAstrometry.load_from_local_archive(673, ARCHIVE)
     start = datetime(2015, 1, 1)
     end = datetime(2016, 1, 1)
     converter = time.default_time_scale_converter()
@@ -137,7 +137,7 @@ def test_online_response_is_cached_in_original_units_before_filtering(target, tm
         query.reset_mock()
         loaded = load_gaia_astrometry(target, archive_path=archive_path)
         query.assert_not_called()
-    expected = GaiaAstrometry.load_from_local_archive(ARCHIVE, target)
+    expected = GaiaAstrometry.load_from_local_archive(target, ARCHIVE)
     expected.apply_filters()
     pd.testing.assert_frame_equal(loaded.table, expected.table)
 
